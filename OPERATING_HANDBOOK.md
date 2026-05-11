@@ -1,8 +1,8 @@
 # Operating handbook for multi-agent production systems
 
 > An inverse pyramid. The most load-bearing items are at the top.
-> If your context is tight, the first three sections are what matter;
-> everything below is reference.
+> If your context is tight, the first three sections are what
+> matters; everything below is reference.
 
 ---
 
@@ -17,24 +17,29 @@ three are part of the operating contract.
 The wake monitor is a long-running process that polls cluster
 surfaces (a local scratchpad daemon, optionally a Firestore-backed
 cross-cluster channel) and emits a notification when a post is
-addressed to *this* agent specifically.
+addressed to *this* agent specifically. Implementation:
+`tools/cluster_wake_filter.py` — a 974-line poll loop that filters
+on `(sender ≠ self) ∧ (recipient ∈ {self_agent_id, group_with_
+urgency})` and emits one stdout line per actionable wake event,
+suppressing ~95% of routine cluster traffic.
 
 ```
-Monitor("python <repo>/tools/cluster_wake_filter.py")
+Monitor("python tools/cluster_wake_filter.py")
 ```
 
 Use the *Monitor primitive* — the tool surface that pipes stdout
 lines back to the agent as notifications. **Do not** use a
 background bash task with the same command. Both keep the process
 alive, but only Monitor surfaces stdout as a wake event. A bash
-background task looks healthy in `ps` and writes wake lines to
-stdout, yet the agent never gets notified — because bash bg tasks
-don't fire task-notification events.
+background task looks healthy in `ps` and writes wake lines to its
+stdout file, yet the agent never gets woken — because bash bg
+tasks don't fire task-notification events.
 
-This is a real trap. Two clusters have hit it at session start.
-The symptom is "wake filter is running, but I'm never woken on
-direct posts." The fix is "stop the bash bg task, re-spawn via
-Monitor."
+This is a real trap. Two clusters hit it at session start. The
+symptom is "wake filter is running, but I'm never woken on direct
+posts." The fix is "stop the bash bg task, re-spawn via Monitor."
+Pinned in the operating doctrine as `cluster_wake_filter_must_use_
+monitor_primitive`.
 
 ### 2. Verify agent identity
 
@@ -47,24 +52,31 @@ The output must print the canonical agent id (e.g.
 `Win/Claude-A`), not empty.
 
 If empty, the wake-filter cursor naming and catch-up digest
-pipeline collide whenever two agents share a filesystem
-identifier (same hostname, same cwd). The fix is *at launch, not
-at runtime*. Set `CLUSTER_AGENT_ID` in the shell before invoking
-the agent — wrap it in a per-agent shell alias if there are
-multiple agents on one machine.
+pipeline collide whenever two agents share a filesystem identifier
+(same hostname, same cwd). This is not a hypothetical — finding
+F1 (PR #76, 2026-05-10 21:38 commit) was exactly this bug:
+`context_threshold_monitor`'s newest-mtime auto-detect silently
+collapsed to whichever agent's session wrote most recently on the
+shared-cwd Macs, masking the explicit `--session-id` flag.
+Operator-caught via "you're falsely reporting the same context as
+mac b, that's a clue." The fix split the discovery branch:
+explicit `--session-id` resolves the `.jsonl` path directly from
+the projects-dir convention; auto-discover preserved for the
+default-unset case.
 
-The pattern: identity at launch is enforced once, by the operator,
-deterministically. Identity at runtime is whatever the agent
-happens to introspect — which is the wrong dependency.
+The pattern: **identity at launch is enforced once, by the
+operator, deterministically.** Identity at runtime is whatever the
+agent happens to introspect — which is the wrong dependency on
+shared-hostname filesystems.
 
 ### 3. Glance at the catch-up digest
 
-The cluster's bridge auto-injects a "## Catch-up: cluster
-activity since last turn" section into every prompt the agent
-receives. Scan it for direct-addressed posts the agent may have
-missed during compaction or overnight. If a catch-up section is
-visible above the user's prompt, the agent is current. If not,
-run the catch-up tool manually once before proceeding.
+The cluster's bridge auto-injects a "## Catch-up: cluster activity
+since last turn" section into every prompt the agent receives (via
+`bridge/catch_up.py`). Scan it for direct-addressed posts the agent
+may have missed during compaction or overnight. If a catch-up
+section is visible above the user's prompt, the agent is current.
+If not, run the catch-up tool manually once before proceeding.
 
 ### When NOT to arm a monitor
 
@@ -108,10 +120,10 @@ debugging "why didn't my item show up?"
 ### 3. Daemon-readiness wait at the wrapper boundary
 
 A common boot race: bridge + daemon both auto-fire on machine
-boot. Bridge wins the race by a few seconds. Bridge's first
-daemon-poll gets connection-refused; bridge's python process
-exits; operator wakes up to a daemon that's running but a bridge
-that quietly died, no items relayed.
+boot via Task Scheduler / launchd. Bridge wins the race by a few
+seconds. Bridge's first daemon-poll gets connection-refused;
+bridge's python process exits; operator wakes up to a daemon
+that's running but a bridge that quietly died, no items relayed.
 
 The fix lives at the **wrapper boundary**, not in the python
 poll loop. The bridge launcher script should poll
@@ -120,25 +132,36 @@ module. Two seconds between polls, 120-second total timeout,
 proceed-with-warning on timeout. Boot-time race is now bounded
 to whatever time the daemon needs to come up cleanly.
 
-This is one instance of a generalizable pattern: wrapper-level
+This pattern shipped in our launchers
+(`bridge/startup/run-bridge.ps1`, `run-bridge.sh`) as the fix for
+a real BigPC boot-race observed 2026-05-12 after operator's
+machine restart. The principle generalizes: wrapper-level
 enforcement of an invariant the substrate downstream of it
 depends on. The python code shouldn't carry boot-order retry
 policy in its exception handling; the wrapper refuses to launch
 python until the dependency is reachable.
 
+Three manifestations of the same auto-detect-canonical-path
+discipline shipped in the same family:
+
+| F-# | Location | What it auto-detects |
+|---|---|---|
+| F6 | `tools/cluster_wake_filter.py:493` | Firestore creds at `~/.extractos-bridge/credentials.json` |
+| F10a | `tools/run_rule_curator_nightly.ps1` | All `PHASESHIFT_BRIDGE_*` env vars for the nightly curator |
+| F10b | `tools/run_wake_harness_nightly.ps1` | Firestore creds for the wake-harness reconciler |
+
 ### 4. Don't restart what's already running
 
-Re-launching a healthy daemon is wasteful (the model cache
-flushes, fresh log lines accumulate, the daemon momentarily
-unresponds during restart). The probe in step 1 is what makes
+Re-launching a healthy daemon flushes its model cache and writes
+fresh log lines for no benefit. The probe in step 1 is what makes
 this fast.
 
 ### 5. Arm the monitor
 
-Machine restart = session restart. The prior wake monitor is
-gone. Re-arm via the TURN ZERO recipe. Re-arming *last* (after
-daemon + bridge) means the monitor is pointed at a healthy
-daemon when it first polls.
+Machine restart = session restart. The prior wake monitor is gone.
+Re-arm via the TURN ZERO recipe. Re-arming *last* (after daemon
++ bridge) means the monitor is pointed at a healthy daemon when
+it first polls.
 
 ---
 
@@ -175,12 +198,51 @@ A scratchpad post with four required fields, in order:
 - Above 88%, compaction is imminent. Writing the breadcrumb
   AFTER compaction starts means losing high-fidelity recall of
   what just happened.
-- Below 88%, premature; the breadcrumb may be out-of-date by
-  the time it's needed.
+- Below 88%, premature; the breadcrumb may be out-of-date by the
+  time it's needed.
 
 The 88% trigger crystallizes the session at peak fidelity. Treat
 it as a hard interrupt — finish the current tool call, then
 breadcrumb, then continue.
+
+### Trigger fortification — V1 → V2
+
+The 88% threshold is one of the SOPs hardest to enforce in prose
+alone — agents are bad at introspecting current context fill, and
+self-reported estimates are unreliable. We learned this
+empirically.
+
+**V1**: byte-count estimation. Rejected after **measured
+calibration drift of 23%** between two same-cluster agents
+(Mac/Claude-A vs Mac/Claude-B) running the same workload — they
+estimated wildly different context-fill percentages because byte-
+count-to-token approximation drifts with content shape. Receipt:
+`mission-control/docs/SOP_AUTOMATION_INVENTORY.md:31`.
+
+**V2** (current): read the *exact* `usage.input_tokens +
+cache_creation_input_tokens + cache_read_input_tokens` directly
+from the session's `.jsonl` file. This is the **substrate-not-
+proxy doctrine** (see below) applied to context-fill measurement:
+don't estimate from a side channel; read the authoritative source.
+
+Implementation lives in two coordinated processes (defense-in-
+depth, shared sentinel — no double-fire):
+
+- **Primary, async-fire** — `tools/context_threshold_monitor.py`,
+  armed via the Monitor primitive. Polls session `.jsonl` token
+  usage; emits a task-notification mid-turn that the agent
+  cannot silently absorb.
+- **Backup, sync-fire** — `tools/breadcrumb_trigger.py`,
+  registered as a `UserPromptSubmit` hook. Catches the threshold
+  on the next prompt boundary if the primary missed (e.g.,
+  Monitor not armed, or Monitor stale due to F9 stale-code-in-
+  memory bug).
+
+The Monitor-primary plus hook-backup arrangement is itself a
+substrate finding: pure-hook fire risks the agent routing around
+it as just-another-system-reminder; pure-Monitor fire risks
+silent Monitor failure. Together, neither failure mode produces
+a missed breadcrumb.
 
 ### Lifecycle
 
@@ -210,17 +272,6 @@ rollover.** Three things substitute for explicit lifecycle:
   resume. The breadcrumb captures the in-flight state so a
   hypothetical hand-off to another agent would land cleanly.
 
-### Trigger fortification
-
-The 88% threshold is one of the SOPs hardest to enforce purely
-in prose — agents are bad at introspecting current context fill,
-and self-reported estimates have been observed to be off by 3-4x.
-The deterministic version reads the agent's session transcript
-file directly and fires a notification when measured fill crosses
-threshold. The agent's job becomes "respond to the notification"
-(reliable), not "remember to check" (unreliable). See PROCESS
-FORTIFICATION DOCTRINE below.
-
 ---
 
 ## PROCESS FORTIFICATION DOCTRINE
@@ -235,12 +286,11 @@ audit and fortify if possible:
 
 1. **Audit.** Identify the SOP — what is the agent supposed to do,
    and when?
-2. **Measure.** Is there a file-system-observable proxy (file
-   size, tool-call argument, event marker) that fires at the same
-   moment the agent would have remembered? If yes → automate. If
-   no → either redesign the SOP to *create* a measurable signal,
-   or accept it stays prose-only with eyes open about its
-   fragility.
+2. **Measure.** Is there a file-system-observable proxy (file size,
+   tool-call argument, event marker) that fires at the same moment
+   the agent would have remembered? If yes → automate. If no →
+   either redesign the SOP to *create* a measurable signal, or
+   accept it stays prose-only with eyes open about its fragility.
 3. **Wire.** Build the deterministic trigger (a session hook, a
    monitor process, a substrate validator) that injects a context-
    reminder when the signal crosses threshold. The agent's job
@@ -249,18 +299,14 @@ audit and fortify if possible:
 
 ### Why this matters
 
-Agent self-tracking failures observed in real operation:
-
-- Eyeball estimate of own context fill: off by 3× (60-75% guess
-  vs 20% real)
-- Eyeball estimate after instrumentation: off by 4× (113% claim
-  vs 20% real — wrong window-size assumption)
-- Lane-stomp corrections from misreading "agent X isn't waking"
-  as "stand down" vs "engage the LGTM ask"
-
-In every case, the cost of getting it wrong was real. In every
-case, a deterministic signal could have fired the right reminder
-at the right moment.
+The 23%-calibration-drift finding (V1 byte-count breadcrumb
+estimation) is one receipt. There are others: lane-stomp
+corrections from misreading wake state, missed breadcrumbs when
+Monitor was running but stale (F9), nightly crons that exit 0
+while silently skipping their actual work (F10). In every case
+the cost of agent-introspection-getting-it-wrong was real, and in
+every case a deterministic signal could have fired the right
+reminder at the right moment.
 
 ### Cost discipline
 
@@ -278,7 +324,9 @@ cheap:
 Maintain a living catalog of SOPs and their automation state.
 Each new hook adds a row. Each prose-only SOP that gains a
 measurable signal moves up the ladder (`prose-only` → `partial`
-→ `automated`).
+→ `automated`). Our internal version lives at
+`mission-control/docs/SOP_AUTOMATION_INVENTORY.md` and tracks
+dozens of disciplines across the three states.
 
 The inventory is itself a portfolio artifact. Reading it tells a
 new agent which signals to expect, and tells the operator which
@@ -301,8 +349,8 @@ applied to two different axes:
 | Enforcement | substrate-boundary-discipline  | Refuse at the schema/validator/sweeper boundary; don't ask agent vigilance. |
 
 substrate-not-proxy and substrate-boundary-discipline are
-complements, not duplicates. The first one says where to *read*
-truth; the second says where to *enforce* truth.
+complements, not duplicates. The first says where to *read* truth;
+the second says where to *enforce* truth.
 
 ### The test
 
@@ -317,43 +365,56 @@ inventory as known-fragile.
 
 ### Receipts
 
-Six concrete instances where moving a rule to the substrate was
-strictly cheaper than relying on agent vigilance:
+By the time finding F6 landed (PR #91 / commit `8cbbd58`,
+2026-05-11), this was the **12th application of SUBSTRATE-BOUNDARY
+DISCIPLINE in a single 3h 44m session** of substrate work. The
+findings closed in that window:
 
-1. **Urgency convention** — a pre-emit validator refuses
-   wake-storm shapes at the scratchpad write boundary instead of
-   asking the sender to remember which urgencies wake the cluster.
-2. **Telemetry schema** — the validator rejects unknown fields at
-   the sink boundary instead of asking writers to remember the
-   schema.
-3. **State-machine lock gate** — the `executing` transition
-   requires all `open_questions` answered; the schema refuses the
-   transition instead of asking the agent to self-check.
-4. **Observation pairing matrix** — the validator refuses
-   non-listed (claim_kind, evidence_kind) combinations at write
-   time instead of asking the caller to remember the matrix.
-5. **Result-kind enum** — a 4-value enum refuses free-form
-   completion shapes at write time instead of asking delegates
-   to remember the canonical names.
-6. **Circuit breaker** — `escalate_after_n_attempts` substrate
-   field plus sweeper-on-read enforcement caps tier-bumps instead
-   of asking the agent to remember to stop retrying.
+| F-# | Closure | Boundary enforced |
+|---|---|---|
+| F1 | PR #76 | `context_threshold_monitor` honors explicit `--session-id` over auto-discover (Voltron co-tenancy on shared-hostname Macs) |
+| F2 (Layer 1) | PR #79 | `pull_route._write_claim` passes `authored_by=ctx.agent_id` |
+| F2 (Layer 2) | PR #81 | `record_observation` refuses `authored_by ∈ {None, "", whitespace}` at the trio's write boundary |
+| F5 | PR #85 | `pull_route` distinguishes `claim_not_visible` from `lost_tiebreak` (daemon read-after-write propagation lag is its own reason tag) |
+| F6 | PR #91 | wake-filter auto-detects creds at canonical bridge path; refuses-at-init with stderr WARNING + B1 telemetry record on missing |
+| F7 (a/b/c) | PR #93 | wake-harness orchestrator contract-drift caught by end-to-end integration smoke |
+| F8 | PR #96 | Drive API helpers always pass `supportsAllDrives=True` (regression-test pins the convention) |
+| F9 | PR #98 | Monitor processes self-restart via `os.execv` when their script mtime advances past process-start |
+| F10 | PR #102 | Nightly cron wrappers auto-detect bridge creds from canonical install path |
+
+Other long-standing substrate-boundary implementations (pre-this-
+session):
+
+- **Urgency convention** — pre-emit validator refuses wake-storm
+  shapes at the scratchpad write boundary instead of asking the
+  sender to remember which urgencies wake the cluster.
+- **Telemetry schema** — the B1 sink validator rejects unknown
+  fields at the write boundary instead of asking writers to
+  remember the schema.
+- **Trio pairing matrix** — refuses non-listed `(claim_kind,
+  evidence_kind)` combinations at write time instead of asking
+  the caller to remember the matrix.
+- **Result-kind enum** — 4-value enum refuses free-form
+  completion shapes at write time.
+- **Circuit breaker** — `escalate_after_n_attempts` substrate
+  field plus sweeper-on-read enforcement caps tier-bumps instead
+  of asking the agent to remember to stop retrying.
 
 ### Bureaucracy-as-token-cost
 
 Bureaucracy in multi-agent systems isn't just deadlock — it's
 tokens spent on coordination instead of work. Every "agent X must
-remember to check Y before doing Z" produces coordination
-overhead that scales with cluster size.
+remember to check Y before doing Z" produces coordination overhead
+that scales with cluster size.
 
-Substrate-boundary enforcement collapses that overhead to a
-single refuse-at-write check, paid once at the boundary
-regardless of how many agents pass through.
+Substrate-boundary enforcement collapses that overhead to a single
+refuse-at-write check, paid once at the boundary regardless of
+how many agents pass through.
 
 Push routing scales O(N×M) coordination tokens. Pull routing with
 a substrate-side capability filter scales O(M). SUBSTRATE-BOUNDARY
-DISCIPLINE pays for itself in both reliability *and* token cost
-— they're the same property looked at from different angles.
+DISCIPLINE pays for itself in both reliability *and* token cost —
+they're the same property looked at from different angles.
 
 ### When to invoke this doctrine
 
@@ -361,7 +422,8 @@ DISCIPLINE pays for itself in both reliability *and* token cost
   the test before deciding what to enforce in code vs. document
   in prose.
 - **Reviewing a "convention" cluster norm** — if the convention
-  can be moved to a refuses-at-write check, propose the migration.
+  can be moved to a refuses-at-write check, propose the
+  migration.
 - **Auditing a session's failure modes** — for each "I forgot to
   do X" or "I assumed Y," ask whether the substrate could have
   refused the failure-shape at the boundary instead.
@@ -373,12 +435,12 @@ DISCIPLINE pays for itself in both reliability *and* token cost
 In a multi-cluster, multi-agent setup, three channels typically
 exist:
 
-| Sender → Recipient                       | Channel                       | Why |
-|------------------------------------------|-------------------------------|-----|
-| Agent → agent **same cluster**           | Local scratchpad daemon        | Free, zero API cost, stays on local daemon, doesn't pollute cross-cluster UI |
-| Agent → agent **across clusters**        | Structured chat collection    | Only durable channels reach foreign clusters |
+| Sender → Recipient                       | Channel                                | Why |
+|------------------------------------------|----------------------------------------|-----|
+| Agent → agent **same cluster**           | Local scratchpad daemon                | Free, zero API cost, stays on local daemon, doesn't pollute cross-cluster UI |
+| Agent → agent **across clusters**        | Structured chat collection (Firestore) | Only durable channels reach foreign clusters |
 | Agent → agent **work artifacts**         | Items collection with brief + extended-report mirror | Heavy schema, lives in feed indefinitely |
-| Human → any agent                        | Same chat collection (UI-side) | Humans on browsers can't hit the daemon |
+| Human → any agent                        | Same chat collection (UI-side)         | Humans on browsers can't hit the daemon |
 
 **Rule of thumb:** if the recipient is on YOUR cluster's daemon,
 use the scratchpad. Otherwise use the structured channel.
@@ -399,12 +461,12 @@ sharp form:
 > Don't use the cross-cluster channel to talk to agents you can
 > already reach via scratchpad.
 
-There's no "save it for important things" budget on the
-scratchpad — it's free, daemon-local, and exists for exactly
-intra-cluster coordination. Chatter freely.
+There's no "save it for important things" budget on the scratchpad
+— it's free, daemon-local, and exists for exactly intra-cluster
+coordination. Chatter freely.
 
-Silence after a coordination event ("ok done, restarted on
-task X") is also the wrong default — explicit telemetry beats
+Silence after a coordination event ("ok done, restarted on task
+X") is also the wrong default — explicit telemetry beats
 inference-by-absence; coordination is the scratchpad's purpose.
 
 ---
@@ -413,20 +475,20 @@ inference-by-absence; coordination is the scratchpad's purpose.
 
 Two distinct uses of "operator identity":
 
-| Use                                        | Identity                  |
-|--------------------------------------------|---------------------------|
-| Human UI sign-in (browser)                 | `<operator>@<domain>`     |
-| Cluster bridge writes (SA-impersonated)    | `<operator>cluster@<domain>` |
+| Use                                        | Identity                       |
+|--------------------------------------------|--------------------------------|
+| Human UI sign-in (browser)                 | `<operator>@<domain>`          |
+| Cluster bridge writes (SA-impersonated)    | `<operator>cluster@<domain>`   |
 
 Per-operator sign-in keeps audit trails distinguishable. The
 bridge SA is what writes durable artifacts (items, build-lore .md
 files); the human is what signs in to the UI.
 
 Internal agent attribution (which Claude in the cluster wrote
-this?) lives in the *artifact metadata* (`authored_by` field),
-not in Firebase Auth. The bridge worker authenticates **once** as
-the cluster operator and writes artifacts tagged with the
-originating agent.
+this?) lives in the *artifact metadata* (`authored_by` field, in
+items + trio observations + scratchpad posts), not in Firebase
+Auth. The bridge worker authenticates **once** as the cluster
+operator and writes artifacts tagged with the originating agent.
 
 This separation lets a leaked bridge SA impersonate the *cluster*
 but not individual agents at the audit level — and the human
@@ -435,21 +497,23 @@ operator emails stay distinct from the cluster bot's writes.
 ### Agent ID at launch
 
 ```
-CLUSTER_AGENT_ID=Mac/Claude-A claude   # zsh / bash
-$env:CLUSTER_AGENT_ID = "Win/Claude"; claude   # PowerShell
+CLUSTER_AGENT_ID=Mac/Claude-A claude               # zsh / bash
+$env:CLUSTER_AGENT_ID = "Win/Claude"; claude       # PowerShell
 ```
 
 The agent shouldn't try to derive its identity at runtime by
 introspecting `hostname` or `whoami`. Two reasons:
 
-1. Macs share a hostname when multiple are open at once. Whoami
-   doesn't disambiguate two Claude sessions on the same Mac.
+1. Multiple agents can share a hostname (e.g., two Claude sessions
+   on the same Mac). Whoami doesn't disambiguate.
 2. Hostname-derivation is the kind of code that works during
    development and silently fails the day a new machine joins
    the cluster with an unexpected hostname.
 
 Identity at launch is enforced once, by the operator, at the
 shell — and inherited deterministically by everything downstream.
+Wrap it in a per-agent shell alias if there are multiple agents
+on one machine.
 
 ---
 
@@ -483,7 +547,8 @@ approval, every time, no inferred consent.
 A typical wake filter wakes when:
 
 - The in-text header `[X → <your agent id> | ...]` addresses the
-  agent directly (or multi-recipient form including the agent's id)
+  agent directly (or multi-recipient form including the agent's
+  id)
 - A cluster broadcast tagged with urgency in `{action, blocker,
   urgent}` arrives
 - A cross-cluster item with the agent's id in `_xClusterTo`
@@ -511,16 +576,17 @@ When a notification arrives:
 
 ### Monitor primitive vs background task
 
-The wake filter (and similar long-running scripts) MUST be
-spawned via the Monitor primitive, not via a background bash
-task. Both keep the python process alive, but ONLY the Monitor
-primitive pipes stdout lines back to the agent as notifications.
-A background bash task with the same command appears healthy
+The wake filter (and similar long-running scripts) MUST be spawned
+via the Monitor primitive, not via a background bash task. Both
+keep the python process alive, but ONLY the Monitor primitive
+pipes stdout lines back to the agent as notifications. A
+background bash task with the same command appears healthy
 (`ps` shows it running, the script writes wake lines to its
 stdout file), and yet the agent never gets woken — because bash
 bg tasks don't surface stdout as task-notification events.
 
-The trap is real. Pin it explicitly in agent instructions.
+Pinned in the operating doctrine as
+`cluster_wake_filter_must_use_monitor_primitive`.
 
 ### Breadcrumb format
 
@@ -538,15 +604,15 @@ picking up deferred work.
 
 ### Quarantine table (project scope discipline)
 
-For sessions that work across multiple projects, maintain a
-table that lists each project and its scope (writable, read-only
+For sessions that work across multiple projects, maintain a table
+that lists each project and its scope (writable, read-only
 reference, frozen quarantined). The HARD PROHIBITIONS rule above
 ("don't write outside project root") becomes operational by
 referencing this table.
 
 ---
 
-*This handbook is the deployable form of operating discipline
-that survived running multi-agent production for months. It is
-not a framework. The implementations behind these patterns are
+*This handbook is the deployable form of operating discipline that
+survived running multi-agent production for months. It is not a
+framework. The implementations behind these patterns are
 proprietary; the discipline is shared.*
