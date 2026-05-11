@@ -373,9 +373,9 @@ findings closed in that window:
 | F-# | Closure | Boundary enforced |
 |---|---|---|
 | F1 | PR #76 | `context_threshold_monitor` honors explicit `--session-id` over auto-discover (Voltron co-tenancy on shared-hostname Macs) |
-| F2 (Layer 1) | PR #79 | `pull_route._write_claim` passes `authored_by=ctx.agent_id` |
-| F2 (Layer 2) | PR #81 | `record_observation` refuses `authored_by ∈ {None, "", whitespace}` at the trio's write boundary |
-| F5 | PR #85 | `pull_route` distinguishes `claim_not_visible` from `lost_tiebreak` (daemon read-after-write propagation lag is its own reason tag) |
+| F2 (Layer 1) | PR #79 | `pull_route._write_claim` passes `authored_by=ctx.agent_id` *(pull-route pattern from ACE; the layer-1 substrate-boundary fix is ours)* |
+| F2 (Layer 2) | PR #81 | `record_observation` refuses `authored_by ∈ {None, "", whitespace}` at the trio's write boundary *(trio shape from ACE; the refuse-at-write boundary enforcement is ours)* |
+| F5 | PR #85 | `pull_route` distinguishes `claim_not_visible` from `lost_tiebreak` (daemon read-after-write propagation lag is its own reason tag) *(our substrate-honesty addition to the ACE-derived pull-route)* |
 | F6 | PR #91 | wake-filter auto-detects creds at canonical bridge path; refuses-at-init with stderr WARNING + B1 telemetry record on missing |
 | F7 (a/b/c) | PR #93 | wake-harness orchestrator contract-drift caught by end-to-end integration smoke |
 | F8 | PR #96 | Drive API helpers always pass `supportsAllDrives=True` (regression-test pins the convention) |
@@ -392,8 +392,9 @@ session):
   fields at the write boundary instead of asking writers to
   remember the schema.
 - **Trio pairing matrix** — refuses non-listed `(claim_kind,
-  evidence_kind)` combinations at write time instead of asking
-  the caller to remember the matrix.
+  evidence_kind)` combinations at write time instead of asking the
+  caller to remember the matrix. *(Trio shape from ACE; the
+  pairing-matrix refuse-at-write enforcement is our addition.)*
 - **Result-kind enum** — 4-value enum refuses free-form
   completion shapes at write time.
 - **Circuit breaker** — `escalate_after_n_attempts` substrate
@@ -411,10 +412,13 @@ Substrate-boundary enforcement collapses that overhead to a single
 refuse-at-write check, paid once at the boundary regardless of
 how many agents pass through.
 
-Push routing scales O(N×M) coordination tokens. Pull routing with
-a substrate-side capability filter scales O(M). SUBSTRATE-BOUNDARY
-DISCIPLINE pays for itself in both reliability *and* token cost —
-they're the same property looked at from different angles.
+Push routing scales O(N×M) coordination tokens. Pull routing with a
+substrate-side capability filter scales O(M) — a property of the
+ACE-style pull-route pattern that the substrate-boundary discipline
+(refuse-at-write on the trio + the F2/F5 fixes) makes production-
+safe. SUBSTRATE-BOUNDARY DISCIPLINE pays for itself in both
+reliability *and* token cost — they're the same property looked at
+from different angles.
 
 ### When to invoke this doctrine
 
