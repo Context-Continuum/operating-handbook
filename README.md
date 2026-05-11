@@ -1,8 +1,10 @@
 # Operating handbook for multi-agent production systems
 
 This is the playbook for keeping multi-agent systems productive in
-production. It's distilled from running a three-agent Claude cluster
-across two physical machines, in real coordinated work, for months.
+production. It's distilled from running a federated, multi-location,
+multi-cluster Claude-agent environment as a two-person operation —
+months of real coordinated work, real production artifacts, real
+substrate findings.
 
 The document is structured as an **inverse pyramid**: the most
 load-bearing items are at the top. If you read only the first three
@@ -37,10 +39,11 @@ Everything below those three is refinement and reference.
    write beats agent-vigilance at every measurable axis.
 
 6. **CHANNEL ROUTING** — audience-based selection between scratchpad
-   (intra-cluster, free), structured chat (cross-cluster), and
-   work-artifact items (anything worth keeping in a feed).
+   (intra-cluster, free), structured chat (cross-cluster, federated),
+   and work-artifact items (anything worth keeping in a feed).
 
 7. **IDENTITY MODEL** — agent ID at launch, never at runtime.
+   Federated identity for multi-operator attribution.
 
 8. **HARD PROHIBITIONS** — actions agents never take without
    explicit per-action approval.
@@ -53,21 +56,25 @@ Everything below those three is refinement and reference.
 Anyone running production agent systems where:
 
 - More than one agent works in parallel
+- More than one *location or operator* coordinates through a shared
+  surface
 - Sessions are long enough that compaction is a real event
 - The substrate (filesystem, daemon, database) has invariants
   that downstream consumers depend on
 - "Just be careful" is not an acceptable enforcement mechanism
 
 If you're running a single one-shot LLM call, you don't need this.
-If you're running an agent that touches production for hours at a
-time and coordinates with other agents, you do.
+If you're running multiple agents across one machine, you'll want
+most of it. If you're running multiple agents across multiple
+locations or operators, you need all of it.
 
 ## What's NOT in this handbook
 
 This is operating discipline — the prose. It is not a framework,
 not a library, not a runnable system. The implementations behind
 these patterns (substrate primitives, observation pipelines, hook
-telemetry sinks, bridge code) are not open-sourced. The value of
+telemetry sinks, bridge code, federation plumbing) are our
+proprietary infrastructure and are not open-sourced. The value of
 this handbook is that it's the playbook for *deploying and running*
 those primitives — the part that doesn't come with any agent
 framework you can `pip install`.
@@ -78,11 +85,13 @@ the substrate needs to do; building it is the work.
 
 ## Versioning
 
-This handbook is V0. It represents the state of the doctrine at one
-point in operation. As more failure modes get crystallized into
-substrate fixes, this document grows.
+This handbook is V0 — the public sanitized form of the V1.x
+operating discipline we maintain internally. As more failure modes
+get crystallized into substrate fixes, both versions grow. The
+public V0 is updated periodically as patterns mature beyond
+operator-specific detail.
 
-Most recently codified additions:
+Most recently codified additions (V0):
 
 - Daemon-readiness wait at wrapper boundary (boot-order race)
 - Self-restart of long-running monitor processes when their script
